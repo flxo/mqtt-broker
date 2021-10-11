@@ -2,6 +2,11 @@ use mqtt_v5_broker::{server_loop, websocket_server_loop, Broker};
 use tokio::runtime::Runtime;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "debug");
+    }
+    env_logger::init();
+
     // Creating a Runtime does the following:
     // * Spawn a background thread running a Reactor instance.
     // * Start a ThreadPool for executing futures.

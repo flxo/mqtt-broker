@@ -1,4 +1,5 @@
 use crate::{client::ClientMessage, tree::SubscriptionTree};
+use log::{info, warn};
 use mqtt_v5::{
     topic::TopicFilter,
     types::{
@@ -208,7 +209,7 @@ impl Broker {
                     .client_sender
                     .try_send(ClientMessage::Disconnect(DisconnectReason::SessionTakenOver))
                 {
-                    println!("Failed to send disconnect packet to taken-over session - {:?}", e);
+                    warn!("Failed to send disconnect packet to taken-over session - {:?}", e);
                 }
             }
 
@@ -257,7 +258,7 @@ impl Broker {
             existing_session.resend_packets();
         }
 
-        println!(
+        info!(
             "Client ID {} connected (Version: {:?})",
             connect_packet.client_id, connect_packet.protocol_version
         );
@@ -429,7 +430,7 @@ impl Broker {
     }
 
     fn handle_disconnect(&mut self, client_id: String, will_disconnect_logic: WillDisconnectLogic) {
-        println!("Client ID {} disconnected", client_id);
+        info!("Client ID {} disconnected", client_id);
 
         let mut disconnect_will = None;
         let mut session_expiry_duration = None;
