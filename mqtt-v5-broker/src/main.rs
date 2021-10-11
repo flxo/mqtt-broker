@@ -1,7 +1,8 @@
-use mqtt_v5_broker::{server_loop, websocket_server_loop, Broker};
-use tokio::runtime::Runtime;
+use futures::{future::try_join, FutureExt};
+use mqtt_v5_broker::{listen, Broker};
+use tokio::{io, runtime::Runtime};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> io::Result<()> {
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "debug");
     }
@@ -17,11 +18,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broker_tx = broker.sender();
     runtime.spawn(broker.run());
 
-    let server_future = server_loop("0.0.0.0:1883", broker_tx.clone());
-    let websocket_future = websocket_server_loop("0.0.0.0:8080", broker_tx);
-
-    runtime.spawn(websocket_future);
-    runtime.block_on(server_future);
-
-    Ok(())
+    let tcp_server = listen("tcp://0.0.0.0:1883", broker_tx.clone());
+    let websocket_server = listen("wss://0.0.0.0:8080", broker_tx);
+    let servers = try_join(tcp_server, websocket_server).map(|_| Ok(()));
+    runtime.block_on(servers)
 }

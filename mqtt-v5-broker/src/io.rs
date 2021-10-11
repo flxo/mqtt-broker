@@ -1,5 +1,3 @@
-use std::fmt;
-
 use crate::{broker::BrokerMessage, client::UnconnectedClient};
 use bytes::BytesMut;
 use futures::{stream, SinkExt, StreamExt};
@@ -14,12 +12,13 @@ use mqtt_v5::{
     },
 };
 use tokio::{
-    net::{TcpListener, TcpStream, ToSocketAddrs},
+    io::{self, AsyncRead, AsyncWrite},
+    net::{TcpListener, UnixListener},
     sync::mpsc::Sender,
 };
 use tokio_util::codec::Framed;
 
-async fn client_handler(stream: TcpStream, broker_tx: Sender<BrokerMessage>) {
+async fn client_handler<I: AsyncRead + AsyncWrite>(stream: I, broker_tx: Sender<BrokerMessage>) {
     debug!("Handling a client");
 
     let (sink, stream) = Framed::new(stream, MqttCodec::new()).split();
@@ -36,7 +35,7 @@ async fn client_handler(stream: TcpStream, broker_tx: Sender<BrokerMessage>) {
     connected_client.run().await;
 }
 
-async fn upgrade_stream(stream: TcpStream) -> Framed<TcpStream, WsMessageCodec> {
+async fn upgrade_stream<I: AsyncRead + AsyncWrite + Unpin>(stream: I) -> Framed<I, WsMessageCodec> {
     let mut upgrade_framed = Framed::new(stream, WsUpgraderCodec::new());
 
     let upgrade_msg = upgrade_framed.next().await;
@@ -54,7 +53,10 @@ async fn upgrade_stream(stream: TcpStream) -> Framed<TcpStream, WsMessageCodec> 
     Framed::from_parts(new_parts)
 }
 
-async fn websocket_client_handler(stream: TcpStream, broker_tx: Sender<BrokerMessage>) {
+async fn websocket_client_handler<I: AsyncRead + AsyncWrite + Unpin>(
+    stream: I,
+    broker_tx: Sender<BrokerMessage>,
+) {
     debug!("Handling a WebSocket client");
 
     let ws_framed = upgrade_stream(stream).await;
@@ -156,37 +158,47 @@ async fn websocket_client_handler(stream: TcpStream, broker_tx: Sender<BrokerMes
     connected_client.run().await;
 }
 
-pub async fn server_loop<A: ToSocketAddrs + fmt::Debug>(addr: A, broker_tx: Sender<BrokerMessage>) {
-    let listener = TcpListener::bind(&addr).await.expect("Couldn't bind to port 1883");
+pub async fn listen(addr: &str, broker_tx: Sender<BrokerMessage>) -> io::Result<()> {
+    let addr = url::Url::parse(addr).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    info!("Listening on {}", addr);
 
-    info!("Listening on {:?}", addr);
+    match addr.scheme() {
+        "unix" => {
+            let listener = UnixListener::bind(&addr.path())?;
+            loop {
+                let (stream, client_addr) = listener.accept().await?;
+                debug!("New unix connection from {:?} on {}", client_addr, addr);
+                tokio::spawn(client_handler(stream, broker_tx.clone()));
+            }
+        },
+        "wss" | "tcp" => {
+            let socket_addr = addr
+                .socket_addrs(|| match addr.scheme() {
+                    "tcp" => Some(1883),
+                    "wss" => Some(8080),
+                    _ => None,
+                })
+                .and_then(|addrs| {
+                    addrs
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to resolve"))
+                })?;
 
-    loop {
-        let (socket, addr) =
-            listener.accept().await.expect("Error in server_loop 'listener.accept()");
-        debug!("Got a new socket from addr: {:?}", addr);
+            let listener = TcpListener::bind(socket_addr).await?;
 
-        let handler = client_handler(socket, broker_tx.clone());
-
-        tokio::spawn(handler);
-    }
-}
-
-pub async fn websocket_server_loop<A: ToSocketAddrs + fmt::Debug>(
-    addr: A,
-    broker_tx: Sender<BrokerMessage>,
-) {
-    let listener = TcpListener::bind(&addr).await.expect("Couldn't bind to port 8080");
-
-    info!("Listening on {:?}", addr);
-
-    loop {
-        let (socket, addr) =
-            listener.accept().await.expect("Error in websocket_server_loop 'listener.accept()");
-        debug!("Got a new socket from addr: {:?}", addr);
-
-        let handler = websocket_client_handler(socket, broker_tx.clone());
-
-        tokio::spawn(handler);
+            loop {
+                let (stream, client_addr) = listener.accept().await?;
+                debug!("New tcp connection from {} on {}", client_addr, addr);
+                match addr.scheme() {
+                    "tcp" => drop(tokio::spawn(client_handler(stream, broker_tx.clone()))),
+                    "wss" => {
+                        drop(tokio::spawn(websocket_client_handler(stream, broker_tx.clone())))
+                    },
+                    _ => unreachable!(),
+                }
+            }
+        },
+        _ => unimplemented!("Unimplemented scheme {}", addr.scheme()),
     }
 }
