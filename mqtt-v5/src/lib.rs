@@ -109,8 +109,8 @@ pub mod websocket {
         }
     }
 
-    #[derive(Debug)]
-    pub struct WsUpgraderCodec {}
+    #[derive(Debug, Default)]
+    pub struct WsUpgraderCodec;
 
     impl WsUpgraderCodec {
         pub fn new() -> Self {
@@ -199,12 +199,6 @@ pub mod websocket {
             }
 
             websocket_key.ok_or(WsDecodeError::MissingWebSocketKey)
-        }
-    }
-
-    impl Default for WsUpgraderCodec {
-        fn default() -> Self {
-            WsUpgraderCodec {}
         }
     }
 

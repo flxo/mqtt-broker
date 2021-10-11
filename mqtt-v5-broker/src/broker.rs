@@ -1,5 +1,6 @@
 use crate::{client::ClientMessage, tree::SubscriptionTree};
 use futures::FutureExt;
+use log::{info, warn};
 use mqtt_v5::{
     topic::TopicFilter,
     types::{
@@ -196,13 +197,15 @@ pub struct Broker {
     subscriptions: SubscriptionTree<SessionSubscription>,
 }
 
-impl Broker {
-    pub fn new() -> Self {
+impl Default for Broker {
+    fn default() -> Self {
         let (sender, receiver) = mpsc::channel(100);
 
         Self { sessions: HashMap::new(), sender, receiver, subscriptions: SubscriptionTree::new() }
     }
+}
 
+impl Broker {
     pub fn sender(&self) -> Sender<BrokerMessage> {
         self.sender.clone()
     }
@@ -217,7 +220,7 @@ impl Broker {
                 if let Err(e) = client_sender
                     .try_send(ClientMessage::Disconnect(DisconnectReason::SessionTakenOver))
                 {
-                    println!("Failed to send disconnect packet to taken-over session - {:?}", e);
+                    warn!("Failed to send disconnect packet to taken-over session - {:?}", e);
                 }
             }
 
@@ -270,7 +273,7 @@ impl Broker {
             existing_session.resend_packets().await;
         }
 
-        println!(
+        info!(
             "Client ID {} connected (Version: {:?})",
             connect_packet.client_id, connect_packet.protocol_version
         );
@@ -442,7 +445,7 @@ impl Broker {
     }
 
     fn handle_disconnect(&mut self, client_id: String, will_disconnect_logic: WillDisconnectLogic) {
-        println!("Client ID {} disconnected", client_id);
+        info!("Client ID {} disconnected", client_id);
 
         let mut disconnect_will = None;
         let mut session_expiry_duration = None;
@@ -796,7 +799,7 @@ mod tests {
 
     #[test]
     fn simple_client_test() {
-        let broker = Broker::new();
+        let broker = Broker::default();
         let sender = broker.sender();
 
         let runtime = Runtime::new().unwrap();

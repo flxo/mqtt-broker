@@ -3,6 +3,7 @@ use futures::{
     future::{self, Either},
     stream, Sink, SinkExt, Stream, StreamExt,
 };
+use log::{debug, info, trace, warn};
 use mqtt_v5::types::{
     DecodeError, DisconnectPacket, DisconnectReason, EncodeError, Packet, ProtocolError,
     ProtocolVersion, QoS,
@@ -38,7 +39,7 @@ impl<ST: Stream<Item = PacketResult> + Unpin, SI: Sink<Packet, Error = EncodeErr
             .await
             .map_err(|_| ProtocolError::ConnectTimedOut)?;
 
-        println!("got a packet: {:?}", first_packet);
+        trace!("got a packet: {:?}", first_packet);
 
         match first_packet {
             Some(Ok(Packet::Connect(mut connect_packet))) => {
@@ -252,7 +253,7 @@ impl<ST: Stream<Item = PacketResult> + Unpin, SI: Sink<Packet, Error = EncodeErr
                         _ => {},
                     },
                     Err(err) => {
-                        println!("Error while reading frame: {:?}", err);
+                        warn!("Error while reading frame: {:?}", err);
                         break;
                     },
                 }
@@ -287,7 +288,7 @@ impl<ST: Stream<Item = PacketResult> + Unpin, SI: Sink<Packet, Error = EncodeErr
                         println!("Failed to send disconnect packet to framed socket: {:?}", e);
                     }
 
-                    println!("broker told the client to disconnect");
+                    info!("broker told the client to disconnect");
 
                     break 'outer;
                 },
@@ -329,6 +330,6 @@ impl<ST: Stream<Item = PacketResult> + Unpin, SI: Sink<Packet, Error = EncodeErr
         // expressions will be unable to continue. If parallelism is required, spawn
         // each async expression using tokio::spawn and pass the join handle to select!.
         future::join(task_rx, task_tx).await;
-        println!("Client ID {} task exit", self.id);
+        debug!("Client ID {} task exit", self.id);
     }
 }
