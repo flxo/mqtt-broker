@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::{broker::BrokerMessage, client::UnconnectedClient};
 use bytes::BytesMut;
 use futures::{stream, SinkExt, StreamExt};
@@ -11,7 +13,7 @@ use mqtt_v5::{
     },
 };
 use tokio::{
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, ToSocketAddrs},
     sync::mpsc::Sender,
 };
 use tokio_util::codec::Framed;
@@ -153,11 +155,10 @@ async fn websocket_client_handler(stream: TcpStream, broker_tx: Sender<BrokerMes
     connected_client.run().await;
 }
 
-pub async fn server_loop(broker_tx: Sender<BrokerMessage>) {
-    let bind_addr = "0.0.0.0:1883";
-    let listener = TcpListener::bind(bind_addr).await.expect("Couldn't bind to port 1883");
+pub async fn server_loop<A: ToSocketAddrs + fmt::Debug>(addr: A, broker_tx: Sender<BrokerMessage>) {
+    let listener = TcpListener::bind(&addr).await.expect("Couldn't bind to port 1883");
 
-    println!("Listening on {}", bind_addr);
+    println!("Listening on {:?}", addr);
 
     loop {
         let (socket, addr) =
@@ -170,11 +171,13 @@ pub async fn server_loop(broker_tx: Sender<BrokerMessage>) {
     }
 }
 
-pub async fn websocket_server_loop(broker_tx: Sender<BrokerMessage>) {
-    let bind_addr = "0.0.0.0:8080";
-    let listener = TcpListener::bind(bind_addr).await.expect("Couldn't bind to port 8080");
+pub async fn websocket_server_loop<A: ToSocketAddrs + fmt::Debug>(
+    addr: A,
+    broker_tx: Sender<BrokerMessage>,
+) {
+    let listener = TcpListener::bind(&addr).await.expect("Couldn't bind to port 8080");
 
-    println!("Listening on {}", bind_addr);
+    println!("Listening on {:?}", addr);
 
     loop {
         let (socket, addr) =

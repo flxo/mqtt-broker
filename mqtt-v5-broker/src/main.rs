@@ -12,8 +12,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broker_tx = broker.sender();
     runtime.spawn(broker.run());
 
-    let server_future = server_loop(broker_tx.clone());
-    let websocket_future = websocket_server_loop(broker_tx);
+    let server_future = server_loop("0.0.0.0:1883", broker_tx.clone());
+    let websocket_future = websocket_server_loop("0.0.0.0:8080", broker_tx);
 
     runtime.spawn(websocket_future);
     runtime.block_on(server_future);
