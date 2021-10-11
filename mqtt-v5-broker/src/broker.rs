@@ -187,13 +187,15 @@ pub struct Broker {
     subscriptions: SubscriptionTree<SessionSubscription>,
 }
 
-impl Broker {
-    pub fn new() -> Self {
+impl Default for Broker {
+    fn default() -> Self {
         let (sender, receiver) = mpsc::channel(100);
 
         Self { sessions: HashMap::new(), sender, receiver, subscriptions: SubscriptionTree::new() }
     }
+}
 
+impl Broker {
     pub fn sender(&self) -> Sender<BrokerMessage> {
         self.sender.clone()
     }
@@ -789,7 +791,7 @@ mod tests {
 
     #[test]
     fn simple_client_test() {
-        let broker = Broker::new();
+        let broker = Broker::default();
         let sender = broker.sender();
 
         let runtime = Runtime::new().unwrap();

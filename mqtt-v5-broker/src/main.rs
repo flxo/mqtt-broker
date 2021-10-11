@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // * Run an instance of Timer per thread pool worker thread.
     let runtime = Runtime::new()?;
 
-    let broker = Broker::new();
+    let broker = Broker::default();
     let broker_tx = broker.sender();
     runtime.spawn(broker.run());
 
