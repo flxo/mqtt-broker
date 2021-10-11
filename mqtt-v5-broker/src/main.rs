@@ -14,7 +14,7 @@ fn main() -> io::Result<()> {
     // * Run an instance of Timer per thread pool worker thread.
     let runtime = Runtime::new()?;
 
-    let broker = Broker::default();
+    let broker = Broker::<()>::default();
     let broker_tx = broker.sender();
     runtime.spawn(broker.run());
 

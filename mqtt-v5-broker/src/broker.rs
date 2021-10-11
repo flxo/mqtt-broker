@@ -1,6 +1,10 @@
-use crate::{client::ClientMessage, tree::SubscriptionTree};
+use crate::{
+    client::ClientMessage,
+    intercept::{ConnectResult, Interceptor, PublishRejectReason, PublishResult, SubscribeResult},
+    tree::SubscriptionTree,
+};
 use futures::FutureExt;
-use log::{info, warn};
+use log::{info, trace, warn};
 use mqtt_v5::{
     topic::TopicFilter,
     types::{
@@ -14,6 +18,7 @@ use mqtt_v5::{
 };
 use std::{
     collections::{hash_map::Entry, HashMap},
+    iter::repeat,
     time::Duration,
 };
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -190,22 +195,40 @@ pub enum BrokerMessage {
     Disconnect(String, WillDisconnectLogic),
 }
 
-pub struct Broker {
+pub struct Broker<I> {
     sessions: HashMap<String, Session>,
     sender: Sender<BrokerMessage>,
     receiver: Receiver<BrokerMessage>,
     subscriptions: SubscriptionTree<SessionSubscription>,
+    interceptor: Option<I>,
 }
 
-impl Default for Broker {
+impl<I> Default for Broker<I> {
     fn default() -> Self {
         let (sender, receiver) = mpsc::channel(100);
 
-        Self { sessions: HashMap::new(), sender, receiver, subscriptions: SubscriptionTree::new() }
+        Self {
+            sessions: HashMap::new(),
+            sender,
+            receiver,
+            subscriptions: SubscriptionTree::new(),
+            interceptor: None,
+        }
     }
 }
 
-impl Broker {
+impl<I: Interceptor + Send> Broker<I> {
+    pub fn with_interceptor(interceptor: I) -> Broker<I> {
+        let (sender, receiver) = mpsc::channel(100);
+        Self {
+            sessions: HashMap::new(),
+            sender,
+            receiver,
+            subscriptions: SubscriptionTree::new(),
+            interceptor: Some(interceptor),
+        }
+    }
+
     pub fn sender(&self) -> Sender<BrokerMessage> {
         self.sender.clone()
     }
@@ -263,6 +286,44 @@ impl Broker {
         connect_packet: ConnectPacket,
         client_msg_sender: Sender<ClientMessage>,
     ) {
+        if let Some(interceptor) = &mut self.interceptor {
+            match interceptor.connect(&connect_packet).await {
+                ConnectResult::Accept => (),
+                ConnectResult::Reject(reason_code) => {
+                    warn!(
+                        "Rejecting connect from {} with {:?}",
+                        connect_packet.client_id, reason_code
+                    );
+                    let connect_ack = ConnectAckPacket {
+                        session_present: false,
+                        reason_code,
+                        session_expiry_interval: None,
+                        receive_maximum: None,
+                        maximum_qos: None,
+                        retain_available: None,
+                        maximum_packet_size: None,
+                        assigned_client_identifier: None,
+                        topic_alias_maximum: None,
+                        reason_string: None,
+                        user_properties: vec![],
+                        wildcard_subscription_available: None,
+                        subscription_identifiers_available: None,
+                        shared_subscription_available: None,
+                        server_keep_alive: None,
+                        response_information: None,
+                        server_reference: None,
+                        authentication_method: None,
+                        authentication_data: None,
+                    };
+                    let packet = Packet::ConnectAck(connect_ack);
+                    // Ignore error if client closed the connection in the meantime
+                    client_msg_sender.send(ClientMessage::Packet(packet)).await.ok();
+
+                    return;
+                },
+            }
+        }
+
         let mut takeover_session = self
             .take_over_existing_client(&connect_packet.client_id, connect_packet.clean_start)
             .await;
@@ -351,6 +412,18 @@ impl Broker {
     async fn handle_subscribe(&mut self, client_id: String, packet: SubscribePacket) {
         let subscriptions = &mut self.subscriptions;
 
+        // Get the interceptor result or a default Accept if none
+        let interceptor_result = {
+            let mut a = None;
+            let mut b = None;
+            if let Some(interceptor) = &mut self.interceptor {
+                a = Some(interceptor.subscribe(&client_id, &packet).await.into_iter())
+            } else {
+                b = Some(repeat(SubscribeResult::Accept).take(packet.subscription_topics.len()));
+            };
+            a.into_iter().flatten().chain(b.into_iter().flatten())
+        };
+
         if let Some(session) = self.sessions.get_mut(&client_id) {
             // If a Server receives a SUBSCRIBE packet containing a Topic Filter that
             // is identical to a Non‑shared Subscription’s Topic Filter for the current
@@ -373,20 +446,30 @@ impl Broker {
             let granted_qos_values = packet
                 .subscription_topics
                 .into_iter()
-                .map(|topic| {
-                    let session_subscription = SessionSubscription {
-                        client_id: client_id.clone(),
-                        maximum_qos: topic.maximum_qos,
-                    };
-                    let token = subscriptions.insert(&topic.topic_filter, session_subscription);
+                .zip(interceptor_result)
+                .map(|(topic, interceptor)| match interceptor {
+                    SubscribeResult::Accept => {
+                        let session_subscription = SessionSubscription {
+                            client_id: client_id.clone(),
+                            maximum_qos: topic.maximum_qos,
+                        };
+                        let token = subscriptions.insert(&topic.topic_filter, session_subscription);
 
-                    session.subscription_tokens.push((topic.topic_filter.clone(), token));
+                        session.subscription_tokens.push((topic.topic_filter.clone(), token));
 
-                    match topic.maximum_qos {
-                        QoS::AtMostOnce => SubscribeAckReason::GrantedQoSZero,
-                        QoS::AtLeastOnce => SubscribeAckReason::GrantedQoSOne,
-                        QoS::ExactlyOnce => SubscribeAckReason::GrantedQoSTwo,
-                    }
+                        match topic.maximum_qos {
+                            QoS::AtMostOnce => SubscribeAckReason::GrantedQoSZero,
+                            QoS::AtLeastOnce => SubscribeAckReason::GrantedQoSOne,
+                            QoS::ExactlyOnce => SubscribeAckReason::GrantedQoSTwo,
+                        }
+                    },
+                    SubscribeResult::Reject(reason) => {
+                        warn!(
+                            "Rejecting subscription from {} on {:?} with {:?}",
+                            client_id, topic.topic_filter, reason
+                        );
+                        reason
+                    },
                 })
                 .collect();
 
@@ -535,6 +618,58 @@ impl Broker {
 
     async fn handle_publish(&mut self, client_id: String, packet: PublishPacket) {
         let mut is_dup = false;
+
+        if let Some(interceptor) = &mut self.interceptor {
+            match interceptor.publish(&client_id, &packet).await {
+                PublishResult::Accept => (),
+                PublishResult::Rejected(PublishRejectReason::PublishAckReason(reason_code)) => {
+                    trace!(
+                        "Rejecting QoS1 publication from {} on {} with {:?}",
+                        client_id,
+                        packet.topic,
+                        reason_code
+                    );
+                    if let Some(session) = self.sessions.get_mut(&client_id) {
+                        let packet_id =
+                            packet.packet_id.expect("Packet with QoS 1 should have a packet ID");
+                        let publish_ack = PublishAckPacket {
+                            packet_id,
+                            reason_code,
+                            reason_string: None,
+                            user_properties: vec![],
+                        };
+
+                        session.send(ClientMessage::Packet(Packet::PublishAck(publish_ack))).await;
+                    }
+                    return;
+                },
+                PublishResult::Rejected(PublishRejectReason::PublishReceivedReason(
+                    reason_code,
+                )) => {
+                    trace!(
+                        "Rejecting QoS2 publication from {} on {} with {:?}",
+                        client_id,
+                        packet.topic,
+                        reason_code
+                    );
+                    if let Some(session) = self.sessions.get_mut(&client_id) {
+                        let packet_id =
+                            packet.packet_id.expect("Packet with QoS 2 should have a packet ID");
+                        let publish_recv = PublishReceivedPacket {
+                            packet_id,
+                            reason_code,
+                            reason_string: None,
+                            user_properties: vec![],
+                        };
+
+                        session
+                            .send(ClientMessage::Packet(Packet::PublishReceived(publish_recv)))
+                            .await;
+                    }
+                    return;
+                },
+            }
+        }
 
         // For QoS2, ensure this packet isn't delivered twice. So if we have an outgoing
         // publish receive with the same ID, just send the publish receive again but don't forward
@@ -799,7 +934,7 @@ mod tests {
 
     #[test]
     fn simple_client_test() {
-        let broker = Broker::default();
+        let broker = Broker::<()>::default();
         let sender = broker.sender();
 
         let runtime = Runtime::new().unwrap();

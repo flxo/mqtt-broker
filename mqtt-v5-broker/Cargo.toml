@@ -9,6 +9,7 @@ authors = ["Brian Schwind <brianmschwind@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+async-trait = "0.1.51"
 bytes = "1"
 env_logger = "0.9"
 futures = "0.3"
