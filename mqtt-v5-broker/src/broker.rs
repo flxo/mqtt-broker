@@ -361,9 +361,7 @@ impl<I: Interceptor + Send> Broker<I> {
             maximum_qos: None,
             retain_available: None,
             maximum_packet_size: None,
-            assigned_client_identifier: Some(AssignedClientIdentifier(
-                connect_packet.client_id.clone(),
-            )),
+            assigned_client_identifier: None,
             topic_alias_maximum: None,
             reason_string: None,
             user_properties: vec![],
