@@ -1,6 +1,6 @@
 use crate::broker::{BrokerMessage, WillDisconnectLogic};
 use futures::{
-    future::{self, Either},
+    future::{self, select, Either},
     stream, Sink, SinkExt, Stream, StreamExt,
 };
 use log::{debug, info, trace, warn};
@@ -11,8 +11,9 @@ use mqtt_v5::types::{
 use nanoid::nanoid;
 use std::{marker::Unpin, time::Duration};
 use tokio::{
+    pin,
     sync::mpsc::{self, Receiver, Sender},
-    time,
+    task, time,
 };
 
 type PacketResult = Result<Packet, DecodeError>;
@@ -20,15 +21,20 @@ type PacketResult = Result<Packet, DecodeError>;
 /// Timeout when writing to a client sink
 const SINK_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
-pub struct UnconnectedClient<ST: Stream<Item = PacketResult>, SI: Sink<Packet, Error = EncodeError>>
+pub struct UnconnectedClient<ST, SI>
+where
+    ST: Stream<Item = PacketResult> + Send + Sync + 'static,
+    SI: Sink<Packet, Error = EncodeError> + Send + Sync + 'static,
 {
     packet_stream: ST,
     packet_sink: SI,
     broker_tx: Sender<BrokerMessage>,
 }
 
-impl<ST: Stream<Item = PacketResult> + Unpin, SI: Sink<Packet, Error = EncodeError>>
-    UnconnectedClient<ST, SI>
+impl<ST, SI> UnconnectedClient<ST, SI>
+where
+    ST: Stream<Item = PacketResult> + Unpin + Send + Sync + 'static,
+    SI: Sink<Packet, Error = EncodeError> + Send + Sync + 'static,
 {
     pub fn new(packet_stream: ST, packet_sink: SI, broker_tx: Sender<BrokerMessage>) -> Self {
         Self { packet_stream, packet_sink, broker_tx }
@@ -39,7 +45,7 @@ impl<ST: Stream<Item = PacketResult> + Unpin, SI: Sink<Packet, Error = EncodeErr
             .await
             .map_err(|_| ProtocolError::ConnectTimedOut)?;
 
-        trace!("Received packet: {:?}", first_packet);
+        trace!("First packet: {:#?}", first_packet);
 
         match first_packet {
             Some(Ok(Packet::Connect(mut connect_packet))) => {
@@ -103,7 +109,11 @@ pub enum ClientMessage {
     Disconnect(DisconnectReason),
 }
 
-pub struct Client<ST: Stream<Item = PacketResult>, SI: Sink<Packet, Error = EncodeError>> {
+pub struct Client<ST, SI>
+where
+    ST: Stream<Item = PacketResult>,
+    SI: Sink<Packet, Error = EncodeError>,
+{
     id: String,
     _protocol_version: ProtocolVersion,
     keepalive_seconds: Option<u16>,
@@ -114,8 +124,10 @@ pub struct Client<ST: Stream<Item = PacketResult>, SI: Sink<Packet, Error = Enco
     self_tx: Sender<ClientMessage>,
 }
 
-impl<ST: Stream<Item = PacketResult> + Unpin, SI: Sink<Packet, Error = EncodeError>>
-    Client<ST, SI>
+impl<ST, SI> Client<ST, SI>
+where
+    ST: Stream<Item = PacketResult> + Unpin + Send + Sync + 'static,
+    SI: Sink<Packet, Error = EncodeError> + Send + Sync + 'static,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -171,9 +183,10 @@ impl<ST: Stream<Item = PacketResult> + Unpin, SI: Sink<Packet, Error = EncodeErr
                 }
             };
 
-            if let Some(frame) = next_packet {
-                match frame {
-                    Ok(frame) => match frame {
+            match next_packet {
+                Some(Ok(frame)) => {
+                    trace!("{}: Processing packet {:#?}", client_id, frame);
+                    match frame {
                         Packet::Subscribe(packet) => {
                             broker_tx
                                 .send(BrokerMessage::Subscribe(client_id.clone(), packet))
@@ -250,15 +263,17 @@ impl<ST: Stream<Item = PacketResult> + Unpin, SI: Sink<Packet, Error = EncodeErr
 
                             return;
                         },
-                        _ => {},
-                    },
-                    Err(err) => {
-                        warn!("Error while reading frame: {:?}", err);
-                        break;
-                    },
-                }
-            } else {
-                break;
+                        p => warn!("Discarding unimplemented packet: {:#?}", p),
+                    }
+                },
+                Some(Err(err)) => {
+                    warn!("{}: Error while reading frame: {:?}", client_id, err);
+                    break;
+                },
+                None => {
+                    info!("{}: Disconnected", client_id);
+                    break;
+                },
             }
         }
 
@@ -268,8 +283,12 @@ impl<ST: Stream<Item = PacketResult> + Unpin, SI: Sink<Packet, Error = EncodeErr
             .expect("Couldn't send Disconnect message to broker");
     }
 
-    async fn handle_socket_writes(sink: SI, mut broker_rx: Receiver<ClientMessage>) {
-        tokio::pin!(sink);
+    async fn handle_socket_writes(
+        sink: SI,
+        client_id: String,
+        mut broker_rx: Receiver<ClientMessage>,
+    ) {
+        pin!(sink);
 
         while let Some(frame) = broker_rx.recv().await {
             let mut packets = match frame {
@@ -285,10 +304,13 @@ impl<ST: Stream<Item = PacketResult> + Unpin, SI: Sink<Packet, Error = EncodeErr
                     };
 
                     if let Err(e) = sink.send(Packet::Disconnect(disconnect_packet)).await {
-                        warn!("Failed to send disconnect packet to framed socket: {:?}", e);
+                        warn!(
+                            "{}: Failed to send disconnect packet to framed socket: {:?}",
+                            client_id, e
+                        );
                     }
 
-                    info!("Broker told the client to disconnect");
+                    info!("{}: Broker told the client to disconnect", client_id);
 
                     return;
                 },
@@ -296,15 +318,16 @@ impl<ST: Stream<Item = PacketResult> + Unpin, SI: Sink<Packet, Error = EncodeErr
 
             // Process each packet in a dedicated timeout to be fair
             while let Some(packet) = packets.next().await {
+                trace!("{}: Sending packet {:#?}", client_id, packet);
                 let send = sink.send(packet);
-                match tokio::time::timeout(SINK_SEND_TIMEOUT, send).await {
+                match time::timeout(SINK_SEND_TIMEOUT, send).await {
                     Ok(Ok(())) => (),
                     Ok(Err(e)) => {
-                        warn!("Failed to write to client client socket: {:?}", e);
+                        warn!("{}: Failed to write to client client socket: {:?}", client_id, e);
                         return;
                     },
                     Err(_) => {
-                        warn!("Timeout during client socket write. Disconnecting");
+                        warn!("{}: Timeout during client socket write. Disconnecting", client_id);
                         return;
                     },
                 }
@@ -313,23 +336,27 @@ impl<ST: Stream<Item = PacketResult> + Unpin, SI: Sink<Packet, Error = EncodeErr
     }
 
     pub async fn run(self) {
-        let task_rx = Self::handle_socket_reads(
-            self.packet_stream,
-            self.id.clone(),
-            self.keepalive_seconds,
-            self.broker_tx,
-            self.self_tx,
-        );
-        let task_tx = Self::handle_socket_writes(self.packet_sink, self.broker_rx);
+        let Client {
+            id,
+            _protocol_version,
+            keepalive_seconds,
+            packet_stream,
+            packet_sink,
+            broker_tx,
+            broker_rx,
+            self_tx,
+        } = self;
 
-        // Note:
-        // https://docs.rs/tokio/1.7.0/tokio/macro.select.html#runtime-characteristics
-        // By running all async expressions on the current task, the expressions are
-        // able to run concurrently but not in parallel. This means all expressions
-        // are run on the same thread and if one branch blocks the thread, all other
-        // expressions will be unable to continue. If parallelism is required, spawn
-        // each async expression using tokio::spawn and pass the join handle to select!.
-        future::join(task_rx, task_tx).await;
-        debug!("Client ID {} task exit", self.id);
+        let task_rx = task::spawn(Self::handle_socket_reads(
+            packet_stream,
+            id.clone(),
+            keepalive_seconds,
+            broker_tx,
+            self_tx,
+        ));
+        let task_tx = task::spawn(Self::handle_socket_writes(packet_sink, id.clone(), broker_rx));
+
+        select(task_rx, task_tx).await;
+        debug!("Client ID {} task exit", id);
     }
 }

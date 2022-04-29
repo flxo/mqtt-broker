@@ -150,8 +150,7 @@ async fn websocket_client_handler(stream: TcpStream, broker_tx: Sender<BrokerMes
         },
     );
 
-    tokio::pin!(stream);
-    let unconnected_client = UnconnectedClient::new(stream, sink, broker_tx);
+    let unconnected_client = UnconnectedClient::new(Box::pin(stream), sink, broker_tx);
 
     let connected_client = match unconnected_client.handshake().await {
         Ok(connected_client) => connected_client,
